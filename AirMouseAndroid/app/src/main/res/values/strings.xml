@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AirMouse</string>
+    <string name="service_desc">Nhận chuột từ máy tính qua Wi-Fi: hiển thị con trỏ trên màn hình và thực hiện thao tác chạm, vuốt, cuộn, Back, Home thay cho bạn.</string>
+</resources>
