@@ -23,6 +23,7 @@ import android.widget.Toast
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.SocketTimeoutException
 import kotlin.concurrent.thread
 import kotlin.math.hypot
 
@@ -56,7 +57,7 @@ class MouseService : AccessibilityService() {
     private var peerAddr: InetAddress? = null
     private var peerPort = 0
 
-    private var active = false
+    @Volatile private var active = false
     private var x = 0f
     private var y = 0f
     private var screenW = 1080
@@ -75,6 +76,8 @@ class MouseService : AccessibilityService() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         updateScreenSize()
         addOverlay()
+        AirState.reset()
+        AirState.serviceRunning = true
         startNetwork()
     }
 
@@ -92,6 +95,8 @@ class MouseService : AccessibilityService() {
     }
 
     private fun shutdown() {
+        AirState.serviceRunning = false
+        AirState.reset()
         running = false
         socket?.close()
         socket = null
@@ -164,14 +169,24 @@ class MouseService : AccessibilityService() {
         thread(name = "airmouse-udp", isDaemon = true) {
             try {
                 val s = DatagramSocket(Config.PORT)
+                s.soTimeout = 3000
                 socket = s
                 val buf = ByteArray(512)
                 while (running) {
                     val p = DatagramPacket(buf, buf.size)
-                    s.receive(p)
+                    try {
+                        s.receive(p)
+                    } catch (_: SocketTimeoutException) {
+                        // Laptop im lặng quá lâu (tắt máy, mất Wi-Fi...) -> ẩn con trỏ, tránh kẹt overlay
+                        if (active && SystemClock.elapsedRealtime() - AirState.lastSeen > LINK_LOST_MS) {
+                            main.post { dropRemote() }
+                        }
+                        continue
+                    }
                     val text = String(p.data, 0, p.length)
                     val bar = text.indexOf('|')
                     if (bar < 0 || text.substring(0, bar) != secret()) continue
+                    AirState.touch(p.address?.hostAddress)
                     val cmd = text.substring(bar + 1).trim()
                     val addr = p.address
                     val port = p.port
@@ -211,14 +226,11 @@ class MouseService : AccessibilityService() {
                 y = ratio * (screenH - 1)
                 active = true
                 leftDown = false
+                AirState.remote = true
                 setShown(true)
                 syncCursor()
             }
-            "LEAVE" -> {
-                active = false
-                leftDown = false
-                setShown(false)
-            }
+            "LEAVE" -> dropRemote()
             "MOVE" -> if (active) {
                 val dx = t.getOrNull(1)?.toFloatOrNull() ?: 0f
                 val dy = t.getOrNull(2)?.toFloatOrNull() ?: 0f
@@ -278,17 +290,23 @@ class MouseService : AccessibilityService() {
         if (dx > 0f && x < 0f) x = 0f
         x = (x + dx).coerceAtMost(screenW - 1f)
         y = (y + dy).coerceIn(0f, screenH - 1f)
-        if (x < -EXIT_OVERSHOOT) {
-            giveBack()
-            return
-        }
+        // Tắt cơ chế tự động trả về khi chạm mép trái để tuân thủ cấu hình "--no-edge" từ PC
+        // if (x < -EXIT_OVERSHOOT) {
+        //     giveBack()
+        //     return
+        // }
         syncCursor()
     }
 
-    private fun giveBack() {
+    private fun dropRemote() {
         active = false
         leftDown = false
+        AirState.remote = false
         setShown(false)
+    }
+
+    private fun giveBack() {
+        dropRemote()
         reply("RETURN ${(y / screenH).coerceIn(0f, 1f)}")
     }
 
@@ -297,6 +315,7 @@ class MouseService : AccessibilityService() {
             "L" -> {
                 val cx = x.coerceAtLeast(0f)
                 if (down) {
+                    cursor?.pulse()
                     leftDown = true
                     downTime = SystemClock.uptimeMillis()
                     downX = cx
@@ -311,8 +330,14 @@ class MouseService : AccessibilityService() {
                     gesture(downX, downY, cx, y, finalDuration, finalDistance.toFloat())
                 }
             }
-            "R" -> if (down) performGlobalAction(GLOBAL_ACTION_BACK)
-            "M" -> if (down) performGlobalAction(GLOBAL_ACTION_HOME)
+            "R" -> if (down) {
+                cursor?.pulse()
+                performGlobalAction(GLOBAL_ACTION_BACK)
+            }
+            "M" -> if (down) {
+                cursor?.pulse()
+                performGlobalAction(GLOBAL_ACTION_HOME)
+            }
         }
     }
 
@@ -418,6 +443,7 @@ class MouseService : AccessibilityService() {
     }
 
     companion object {
+        private const val LINK_LOST_MS = 15_000L
         private const val EXIT_OVERSHOOT = 60f   // kéo qua mép trái bao nhiêu px thì trả chuột về laptop
         private const val DRAG_THRESHOLD = 15f
         private const val LONG_PRESS_MS = 450L
